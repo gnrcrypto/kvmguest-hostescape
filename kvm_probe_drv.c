@@ -563,7 +563,7 @@ static int __init mod_init(void) {
     if (major_num < 0)
         return major_num;
     
-    driver_class = class_create(DRIVER_NAME);
+    driver_class = class_create(THIS_MODULE, DRIVER_NAME);
     if (IS_ERR(driver_class)) {
         unregister_chrdev(major_num, DEVICE_FILE_NAME);
         return PTR_ERR(driver_class);
