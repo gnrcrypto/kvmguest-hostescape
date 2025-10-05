@@ -1,1 +1,0 @@
-savedcmd_/workspaces/kvmguest-hostescape/Module.symvers :=  scripts/mod/modpost -M -m -a      -o /workspaces/kvmguest-hostescape/Module.symvers -T /workspaces/kvmguest-hostescape/modules.order -i Module.symvers -e 
