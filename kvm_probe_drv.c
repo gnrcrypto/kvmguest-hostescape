@@ -23,11 +23,6 @@
 #define DRIVER_NAME "kvm_probe_drv"
 #define DEVICE_FILE_NAME "kvm_probe_dev"
 
-static void *g_vq_virt_addr = NULL;
-static dma_addr_t g_vq_phys_addr = 0;
-static unsigned long g_vq_pfn = 0;
-static unsigned long g_flag_value = 0;
-
 // Kprobe-based kallsyms lookup
 static unsigned long (*kallsyms_lookup_name_fn)(const char *name) = NULL;
 
@@ -60,13 +55,13 @@ struct mmio_data {
 };
 
 struct gpa_io_data {
-    unsigned long gpa;          // Guest Physical Address
+    unsigned long gpa;
     unsigned long size;
     unsigned char __user *user_buffer;
 };
 
 struct hpa_io_data {
-    unsigned long hpa;          // Host Physical Address (for exploitation)
+    unsigned long hpa;
     unsigned long size;
     unsigned char __user *user_buffer;
 };
@@ -96,33 +91,30 @@ struct hypercall_args {
     unsigned long arg1;
     unsigned long arg2;
     unsigned long arg3;
+    long ret_value;  // Return value from hypercall (rax)
 };
 
 // IOCTL definitions
 #define IOCTL_READ_PORT          0x1001
 #define IOCTL_WRITE_PORT         0x1002
-#define IOCTL_READ_MMIO          0x1003  // Hardware/BAR access (uses ioremap)
-#define IOCTL_WRITE_MMIO         0x1004  // Hardware/BAR access (uses ioremap)
-#define IOCTL_ALLOC_VQ_PAGE      0x1005
-#define IOCTL_FREE_VQ_PAGE       0x1006
+#define IOCTL_READ_MMIO          0x1003
+#define IOCTL_WRITE_MMIO         0x1004
 #define IOCTL_TRIGGER_HYPERCALL  0x1008
 #define IOCTL_READ_KERNEL_MEM    0x1009
 #define IOCTL_WRITE_KERNEL_MEM   0x100A
-#define IOCTL_READ_FLAG_ADDR     0x100C
-#define IOCTL_WRITE_FLAG_ADDR    0x100D
 #define IOCTL_GET_KASLR_SLIDE    0x100E
 #define IOCTL_VIRT_TO_PHYS       0x100F
 #define IOCTL_HYPERCALL_ARGS     0x1012
 #define IOCTL_READ_FILE          0x1013
-#define IOCTL_READ_GPA           0x1014  // Read GUEST physical address
-#define IOCTL_WRITE_GPA          0x1015  // Write GUEST physical address
+#define IOCTL_READ_GPA           0x1014
+#define IOCTL_WRITE_GPA          0x1015
 #define IOCTL_PHYS_TO_VIRT       0x1018
-#define IOCTL_READ_HPA           0x1019  // Read HOST physical (via ioremap)
-#define IOCTL_WRITE_HPA          0x101A  // Write HOST physical (via ioremap)
+#define IOCTL_READ_HPA           0x1019
+#define IOCTL_WRITE_HPA          0x101A
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("KVM Probe Lab");
-MODULE_DESCRIPTION("Enhanced kernel module for KVM exploitation - proper address handling");
+MODULE_DESCRIPTION("Enhanced kernel module for KVM exploitation - proper hypercall handling");
 
 static int major_num;
 static struct class* driver_class = NULL;
@@ -147,6 +139,9 @@ static long do_hypercall(struct hypercall_args *args) {
     long ret;
     u64 start = ktime_get_ns();
 
+    printk(KERN_INFO "%s: HYPERCALL nr=%lu, args=[0x%lx, 0x%lx, 0x%lx, 0x%lx]\n",
+           DRIVER_NAME, nr, a0, a1, a2, a3);
+
     if (a0 == 0 && a1 == 0 && a2 == 0 && a3 == 0) {
         ret = kvm_hypercall0(nr);
     } else if (a1 == 0 && a2 == 0 && a3 == 0) {
@@ -160,8 +155,9 @@ static long do_hypercall(struct hypercall_args *args) {
     }
 
     u64 end = ktime_get_ns();
-    printk(KERN_INFO "%s: HYPERCALL(%lu) executed | latency=%llu ns | ret=%ld\n",
-           DRIVER_NAME, nr, end - start, ret);
+    printk(KERN_INFO "%s: HYPERCALL(%lu) completed | latency=%llu ns | rax=0x%lx (%ld)\n",
+           DRIVER_NAME, nr, end - start, ret, ret);
+    
     return ret;
 }
 
@@ -230,13 +226,7 @@ static unsigned long detect_host_kaslr(void) {
     return 0;
 }
 
-/*
- * CRITICAL FUNCTION: Handle GUEST Physical Address
- * GPA is what the guest thinks is physical RAM
- * We use __va() to convert to kernel virtual address
- */
 static unsigned long gpa_to_kva(unsigned long gpa) {
-    // In guest kernel, our "physical" addresses map via __va()
     return (unsigned long)__va(gpa);
 }
 
@@ -279,13 +269,6 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
             force_hypercall();
             break;
 
-        /*
-         * MMIO: Uses ioremap() - accesses hardware/PCI BARs
-         * This CAN access host physical memory IF:
-         * - The address is a valid BAR
-         * - The BAR is mapped to host memory
-         * - There's an IVSHMEM or similar device
-         */
         case IOCTL_READ_MMIO: {
             struct mmio_data data;
             void *kbuf;
@@ -371,10 +354,6 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
             return 0;
         }
 
-        /*
-         * GPA: GUEST Physical Address operations
-         * These access the GUEST's physical memory (converted to kernel virtual)
-         */
         case IOCTL_READ_GPA: {
             struct gpa_io_data data;
             unsigned long kva;
@@ -430,10 +409,6 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
             return 0;
         }
 
-        /*
-         * HPA: HOST Physical Address operations (exploitation primitive)
-         * Uses ioremap() - same as MMIO but with clearer semantics
-         */
         case IOCTL_READ_HPA: {
             struct hpa_io_data data;
             void __iomem *hpa_mapped;
@@ -507,44 +482,16 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg) {
             return 0;
         }
 
-        case IOCTL_READ_KERNEL_MEM: {
-            struct kvm_kernel_mem_read req;
-            if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
-                return -EFAULT;
-            if (!req.kernel_addr || !req.length || !req.user_buf)
-                return -EINVAL;
-            if (copy_to_user(req.user_buf, (void *)req.kernel_addr, req.length))
-                return -EFAULT;
-            force_hypercall();
-            break;
-        }
-
-        case IOCTL_WRITE_KERNEL_MEM: {
-            struct kvm_kernel_mem_write req;
-            void *tmp;
-            if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
-                return -EFAULT;
-            if (!req.kernel_addr || !req.length || !req.user_buf)
-                return -EINVAL;
-            tmp = kmalloc(req.length, GFP_KERNEL);
-            if (!tmp) return -ENOMEM;
-            if (copy_from_user(tmp, req.user_buf, req.length)) {
-                kfree(tmp);
-                return -EFAULT;
-            }
-            memcpy((void *)req.kernel_addr, tmp, req.length);
-            kfree(tmp);
-            force_hypercall();
-            break;
-        }
-
         case IOCTL_HYPERCALL_ARGS: {
             struct hypercall_args args;
-            long ret;
             if (copy_from_user(&args, (void __user *)arg, sizeof(args)))
                 return -EFAULT;
-            ret = do_hypercall(&args);
-            if (copy_to_user((void __user *)arg, &ret, sizeof(ret)))
+            
+            // Execute hypercall and store return value
+            args.ret_value = do_hypercall(&args);
+            
+            // Copy entire struct back (includes ret_value from rax)
+            if (copy_to_user((void __user *)arg, &args, sizeof(args)))
                 return -EFAULT;
             break;
         }
@@ -610,7 +557,7 @@ static const struct file_operations fops = {
 };
 
 static int __init mod_init(void) {
-    printk(KERN_INFO "%s: Init - Proper GPA/HPA handling\n", DRIVER_NAME);
+    printk(KERN_INFO "%s: Init - Proper hypercall buffer handling\n", DRIVER_NAME);
 
     major_num = register_chrdev(0, DEVICE_FILE_NAME, &fops);
     if (major_num < 0)
@@ -630,7 +577,7 @@ static int __init mod_init(void) {
     }
     
     printk(KERN_INFO "%s: Device /dev/%s created\n", DRIVER_NAME, DEVICE_FILE_NAME);
-    printk(KERN_INFO "%s: GPA ops access GUEST memory, MMIO/HPA ops can access HOST\n", DRIVER_NAME);
+    printk(KERN_INFO "%s: Hypercalls return data via guest buffers + rax status\n", DRIVER_NAME);
     return 0;
 }
 

