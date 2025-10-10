@@ -297,6 +297,7 @@ run_basic_tests() {
 
     echo -e "${BLUE}Test 1: Device Access${NC}"
     if kvm_prober getkaslr &>/dev/null; then
+        kvm_prober alloc_shared
         kvm_prober getkaslr
         print_success "KASLR detection works"
     else
