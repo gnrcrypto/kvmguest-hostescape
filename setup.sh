@@ -1,4 +1,4 @@
-#!/bin/bash
+            #!/bin/bash
 # KVM CTF Exploit Suite - FINAL Setup Script
 # Updated for correct GPA/HPA handling and fixed bash arithmetic
 
@@ -164,29 +164,6 @@ install_tools() {
     print_success "Tools installed to /usr/local/bin/"
 }
 
-    echo -e "\n\033[1;36m[*] Ensuring environment is ready...\033[0m"
-
-    if grep -qw "nokaslr" /proc/cmdline; then
-        echo "[+] KASLR is DISABLED (nokaslr in cmdline)"
-    else
-        echo "[!] KASLR is ENABLED - attempting to disable for next boot..."
-        # Add nokaslr to GRUB if not already present
-        if ! grep -qw "nokaslr" /etc/default/grub; then
-             sed -i 's/^GRUB_CMDLINE_LINUX=\"/GRUB_CMDLINE_LINUX=\"nokaslr /' /etc/default/grub
-             update-grub
-            echo "[+] 'nokaslr' added to GRUB. You must reboot for KASLR to be disabled."
-            echo "[+] Reboot now? (y/N)"
-            read answer
-            if [[ "$answer" =~ ^[Yy]$ ]]; then
-                 reboot
-            else
-                echo "[!] KASLR will remain enabled until you reboot."
-            fi
-        else
-            echo "[*] 'nokaslr' already in /etc/default/grub. Just reboot to disable KASLR."
-        fi
-    fi
-
 show_address_warning() {
     echo ""
     print_critical "═══════════════════════════════════════════════════════"
@@ -255,7 +232,7 @@ show_pci_info() {
                     start=${parts[0]}
                     end=${parts[1]}
                     flags=${parts[2]}
-                    if [ "$start" != "0x0000000000000000" ]; then
+        if [ "$start" != "0x0000000000000000" ]; then
                         # Use python3 for hex arithmetic (bash can't handle large hex)
                         size=$(python3 -c "print(int('${end}', 16) - int('${start}', 16) + 1)" 2>/dev/null || echo "unknown")
                         is_io=$(python3 -c "print(int('${flags}', 16) & 0x1)" 2>/dev/null || echo "0")
